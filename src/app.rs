@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -8,22 +8,42 @@ use eframe::egui;
 use crate::config::{self, AppConfig};
 use crate::core::{
     list_input_devices, timestamp, to_int, trim_entries, trim_lines, SingleInstanceGuard,
+    whisper_setup,
 };
 use crate::services::{
     ai::{spawn_ai_request, AiEvent, AiSession},
     audio::{AudioMode, AudioRecorder, SAMPLE_RATE},
     hotkeys::{HotkeyAction, HotkeyService},
-    transcriber::{TranscriberService, TranscriptEvent},
+    whisper::{WhisperEvent, WhisperService},
 };
 use crate::ui::locale::{self, Lang};
 use crate::ui::theme::{apply_theme, draw_header, Theme};
 use egui::Color32;
 
-/// Предел строк в логах (старые строки вырезаются, чтобы не жрать память).
 const MAX_LOG_LINES: usize = 5000;
-
-/// Предел записей в истории вопросов/ответов (одна запись = вопрос или ответ).
 const MAX_HISTORY_ENTRIES: usize = 500;
+
+/// Состояние процесса Apply Changes (видно UI).
+#[derive(Clone, Debug, Default)]
+pub struct ApplyProgress {
+    pub active: bool,
+    pub stage: String, // "idle" | "dll" | "model" | "load" | "done" | "error"
+    pub name: String,
+    pub downloaded: u64,
+    pub total: u64,
+    pub last_log_pct: i64,
+}
+
+impl ApplyProgress {
+    /// Текущий процент прогресса (0..=100). 0 если total неизвестен.
+    pub fn pct(&self) -> i32 {
+        if self.total == 0 {
+            0
+        } else {
+            ((self.downloaded as f64 / self.total as f64) * 100.0) as i32
+        }
+    }
+}
 
 pub struct InterviewApp {
     pub cfg: AppConfig,
@@ -40,12 +60,12 @@ pub struct InterviewApp {
     pub history_answers: String,
     pub status: String,
     pub transcript_hint: String,
-    pub vosk_status: String,
+    pub whisper_status: String,
     pub config_preview: String,
     pub chunk_ms_text: String,
     pub auto_ask_text: String,
-    pub tail_ms_text: String,
     pub lang: Lang,
+    pub selected_whisper_model: String,
 
     pub device_names: Vec<String>,
     pub recording: bool,
@@ -53,14 +73,14 @@ pub struct InterviewApp {
     pub active_hold: Option<HotkeySide>,
 
     audio: AudioRecorder,
-    transcriber: TranscriberService,
-    ai: Arc<Mutex<AiSession>>,
+    pub whisper: WhisperService,
+    ai: Arc<StdMutex<AiSession>>,
     audio_buffer: Vec<i16>,
 
     audio_tx: Sender<Vec<i16>>,
     audio_rx: Receiver<Vec<i16>>,
-    transcript_tx: Sender<TranscriptEvent>,
-    transcript_rx: Receiver<TranscriptEvent>,
+    whisper_tx: Sender<WhisperEvent>,
+    whisper_rx: Receiver<WhisperEvent>,
     ai_tx: Sender<AiEvent>,
     ai_rx: Receiver<AiEvent>,
     hotkey_rx: Receiver<HotkeyAction>,
@@ -70,15 +90,14 @@ pub struct InterviewApp {
     auto_ask_deadline: Option<Instant>,
     awaiting_transcript: bool,
     ai_busy: bool,
-    /// Флаг: остановка запрошена, но поток ещё собирает хвост loopback (неблокирующая остановка).
     stopping: bool,
 
-    // UI state
     pub config_edit_mode: bool,
     pub ai_request_time: Option<Instant>,
     pub big_status: String,
-    /// Время последнего нажатия «Сохранить» в настройках (для временной плашки).
     pub settings_saved_at: Option<Instant>,
+
+    pub apply_progress: ApplyProgress,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,14 +111,13 @@ impl InterviewApp {
         let cfg = config::load();
         let chunk_ms_text = cfg.chunk_ms.to_string();
         let auto_ask_text = cfg.auto_ask_sec.to_string();
-        let tail_ms_text = cfg.tail_ms.to_string();
         let (audio_tx, audio_rx) = unbounded();
-        let (transcript_tx, transcript_rx) = unbounded();
+        let (whisper_tx, whisper_rx) = unbounded();
         let (ai_tx, ai_rx) = unbounded();
         let (hotkey_tx, hotkey_rx) = unbounded();
 
-        let ai = Arc::new(Mutex::new(AiSession::new(cfg.clone())));
-        let transcriber = TranscriberService::new();
+        let ai = Arc::new(StdMutex::new(AiSession::new(cfg.clone())));
+        let whisper = WhisperService::new();
         let hotkeys = HotkeyService::install(hotkey_tx).ok();
 
         let lang = Lang::from_str(&cfg.lang);
@@ -118,25 +136,25 @@ impl InterviewApp {
             history_answers: String::new(),
             status: locale::t(lang, "header.hint").to_string(),
             transcript_hint: locale::t(lang, "main.live_speech").to_string(),
-            vosk_status: locale::t(lang, "vosk.not_loaded").to_string(),
+            whisper_status: locale::t(lang, "whisper.not_loaded").to_string(),
             config_preview: serde_json::to_string(&cfg).unwrap_or_default(),
             chunk_ms_text,
             auto_ask_text,
-            tail_ms_text,
             lang,
+            selected_whisper_model: cfg.whisper_model.clone(),
             device_names: Vec::new(),
             recording: false,
             record_mode: None,
             active_hold: None,
 
             audio: AudioRecorder::new(),
-            transcriber,
+            whisper,
             ai,
             audio_buffer: Vec::new(),
             audio_tx,
             audio_rx,
-            transcript_tx,
-            transcript_rx,
+            whisper_tx,
+            whisper_rx,
             ai_tx,
             ai_rx,
             hotkey_rx,
@@ -150,15 +168,15 @@ impl InterviewApp {
             ai_request_time: None,
             big_status: String::new(),
             settings_saved_at: None,
+            apply_progress: ApplyProgress::default(),
         };
 
         app.refresh_devices();
         app.log("App initialized");
-        app.load_vosk();
+        app.auto_load_whisper();
         app
     }
 
-    /// Взять строку локализации по ключу.
     pub fn t(&self, key: &str) -> &'static str {
         locale::t(self.lang, key)
     }
@@ -166,7 +184,6 @@ impl InterviewApp {
     pub fn log(&mut self, msg: &str) {
         let line = format!("[{}] {msg}\n", timestamp());
         self.logs.push_str(&line);
-        // Обрезаем логи до последних N строк (чтобы не росли бесконечно).
         trim_lines(&mut self.logs, MAX_LOG_LINES);
     }
 
@@ -219,12 +236,12 @@ impl InterviewApp {
     pub fn save_config(&mut self) {
         self.sync_numeric_fields();
         self.cfg.lang = self.lang.as_str().to_string();
+        self.cfg.whisper_model = self.selected_whisper_model.clone();
         self.auto_ask_deadline = None;
         if let Err(err) = config::save(&self.cfg) {
             self.log(&format!("Save error: {err}"));
         } else {
             self.log("Config saved");
-            self.ai.lock().unwrap().configure(self.cfg.clone());
         }
         self.refresh_config_preview();
     }
@@ -250,7 +267,7 @@ impl InterviewApp {
                     self.cfg = cfg;
                     self.chunk_ms_text = self.cfg.chunk_ms.to_string();
                     self.auto_ask_text = self.cfg.auto_ask_sec.to_string();
-                    self.tail_ms_text = self.cfg.tail_ms.to_string();
+                    self.selected_whisper_model = self.cfg.whisper_model.clone();
                     self.refresh_config_preview();
                     self.log(&format!("Imported: {}", path.display()));
                 }
@@ -260,56 +277,122 @@ impl InterviewApp {
     }
 
     pub fn refresh_config_preview(&mut self) {
-        // Обычный to_string (без pretty) работает в разы быстрее.
-        // Для превью в настройках скорость важнее читаемости:
-        // refresh_config_preview дёргается при каждом save/detect_device.
         self.config_preview = serde_json::to_string(&self.cfg).unwrap_or_default();
     }
 
     fn sync_numeric_fields(&mut self) {
         self.cfg.chunk_ms = to_int(&self.chunk_ms_text, 250).max(20) as u32;
         self.cfg.auto_ask_sec = to_int(&self.auto_ask_text, 0).max(0) as u32;
-        self.cfg.tail_ms = to_int(&self.tail_ms_text, 6000).max(0) as u32;
     }
 
-    /// Загружает VOSK-модель из пути, указанного в конфиге.
-    pub fn load_vosk(&mut self) {
-        let path = self.cfg.vosk_model_path.clone();
-        if path.is_empty() {
-            self.vosk_status = self.t("vosk.no_path").to_string();
-            self.log("VOSK: no model path configured");
-            return;
-        }
-        if self.transcriber.is_loading() {
-            self.log("VOSK: already loading, skipping");
-            return;
-        }
-        if self.transcriber.is_loaded() {
-            self.log("VOSK: already loaded, skipping");
-            return;
-        }
-        let tx = self.transcript_tx.clone();
-        self.vosk_status = self.t("vosk.loading").to_string();
-        self.transcriber.load_async(PathBuf::from(&path), tx);
-        self.log(&format!("VOSK load started: {path}"));
-    }
-
-    /// Открывает диалог выбора папки с VOSK-моделью (только прописывает путь).
-    pub fn browse_vosk_model(&mut self) {
-        if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-            self.cfg.vosk_model_path = dir.display().to_string();
-            self.refresh_config_preview();
-            self.save_config();
-            self.log(&format!("VOSK model path set: {}", self.cfg.vosk_model_path));
+    fn model_path(&self) -> PathBuf {
+        let dir = crate::core::helpers::whisper_dir();
+        match self.selected_whisper_model.as_str() {
+            "medium" => dir.join("ggml-medium.bin"),
+            "small.en" => dir.join("ggml-small.en.bin"),
+            "medium.en" => dir.join("ggml-medium.en.bin"),
+            _ => dir.join("ggml-small.bin"),
         }
     }
 
-    pub fn reload_vosk(&mut self) {
+    /// Автозагрузка при старте: если модель скачана — грузим
+    fn auto_load_whisper(&mut self) {
+        let model_path = self.model_path();
+        let dll_dir = crate::core::helpers::whisper_dir();
+
+        if !model_path.exists() {
+            self.whisper_status = format!(
+                "{} (выберите модель в настройках)",
+                model_path.file_name().unwrap_or_default().to_string_lossy()
+            );
+            self.log(&format!("Whisper model not found: {}", model_path.display()));
+            return;
+        }
+
+        let tx = self.whisper_tx.clone();
+        self.whisper_status = self.t("whisper.loading").to_string();
+        self.whisper.load_async(dll_dir, model_path, tx);
+        self.log("Whisper: auto-load started");
+    }
+
+    /// ЕДИНСТВЕННАЯ кнопка Apply Changes.
+    /// Скачивает DLL+модель (если их нет) и загружает в Whisper.
+    /// Все шаги логируются и шлют прогресс в UI.
+    pub fn apply_whisper_selection(&mut self) {
         self.save_config();
-        let path = PathBuf::from(self.cfg.vosk_model_path.clone());
-        let tx = self.transcript_tx.clone();
-        self.transcriber.reload_async(Some(path), tx);
-        self.log("VOSK reload");
+        self.whisper.unload();
+        self.apply_progress = ApplyProgress {
+            active: true,
+            stage: "start".into(),
+            ..Default::default()
+        };
+        self.whisper_status = self.t("settings.applying").to_string();
+        self.log("Apply Changes: started");
+
+        let model_name = self.selected_whisper_model.clone();
+        let tx = self.whisper_tx.clone();
+        let dll_dir = crate::core::helpers::whisper_dir();
+
+        std::thread::spawn(move || {
+            // === Шаг 1: whisper.dll ===
+            let _ = tx.send(WhisperEvent::Status("Шаг 1/3: проверка whisper.dll".into()));
+            match whisper_setup::ensure_whisper_dll(&tx) {
+                Ok(_) => {
+                    let _ = tx.send(WhisperEvent::Status(
+                        "Шаг 1/3: whisper.dll готов".into(),
+                    ));
+                }
+                Err(e) => {
+                    let _ = tx.send(WhisperEvent::Error(format!(
+                        "whisper.dll: ошибка скачивания/распаковки: {e}"
+                    )));
+                    return;
+                }
+            }
+
+            // === Шаг 2: модель ===
+            let kind = match model_name.as_str() {
+                "medium" => whisper_setup::ModelKind::Medium,
+                "small.en" => whisper_setup::ModelKind::SmallEn,
+                "medium.en" => whisper_setup::ModelKind::MediumEn,
+                _ => whisper_setup::ModelKind::Small,
+            };
+            let _ = tx.send(WhisperEvent::Status(format!(
+                "Шаг 2/3: модель {} (ожидаемый размер: {})",
+                kind.file_name(),
+                whisper_setup::human_size(kind.expected_size())
+            )));
+            match whisper_setup::download_model(kind, &tx) {
+                Ok(_) => {
+                    let _ = tx.send(WhisperEvent::Status(format!(
+                        "Шаг 2/3: {} скачана",
+                        kind.file_name()
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(WhisperEvent::Error(format!(
+                        "Модель {}: ошибка скачивания: {e}",
+                        kind.file_name()
+                    )));
+                    return;
+                }
+            }
+
+            // === Шаг 3: загрузка в Whisper ===
+            let _ = tx.send(WhisperEvent::Status(
+                "Шаг 3/3: загрузка модели в Whisper...".into(),
+            ));
+            let model_path = match model_name.as_str() {
+                "medium" => dll_dir.join("ggml-medium.bin"),
+                "small.en" => dll_dir.join("ggml-small.en.bin"),
+                "medium.en" => dll_dir.join("ggml-medium.en.bin"),
+                _ => dll_dir.join("ggml-small.bin"),
+            };
+            let _ = tx.send(WhisperEvent::LoadRequest {
+                dll_dir: dll_dir.clone(),
+                model_path,
+            });
+        });
     }
 
     pub fn test_ai(&mut self) {
@@ -332,7 +415,6 @@ impl InterviewApp {
             self.set_status(self.t("main.no_text"));
             return;
         }
-        // Запоминаем предыдущий вопрос и ответ (для кнопок истории).
         if self.prev_question != q {
             self.prev_question = self.question.clone();
         }
@@ -354,34 +436,24 @@ impl InterviewApp {
     }
 
     fn start_recording(&mut self, mode: AudioMode) {
-        if self.recording {
-            return;
-        }
-        // Проверяем, загружен ли VOSK.
-        if !self.transcriber.is_loaded() && !self.transcriber.is_loading() {
-            self.big_status = self.t("main.vosk_not_loaded").to_string();
+        if self.recording { return; }
+        if !self.whisper.is_loaded() {
+            self.big_status = self.t("main.whisper_not_loaded").to_string();
             self.set_status(self.t("status.recording_blocked"));
-            self.log("Recording blocked: VOSK not loaded");
+            self.log("Recording blocked: Whisper not loaded");
             return;
         }
         self.save_config();
         self.sync_numeric_fields();
-        self.audio_buffer.clear();
-        // Очищаем транскрипт для нового вопроса (как в C# версии: заменяем, а не дополняем).
         self.transcript.clear();
+        self.audio_buffer.clear();
 
         let device = match mode {
             AudioMode::Loopback => self.cfg.loopback_device.clone(),
             AudioMode::Mic => self.cfg.mic_device.clone(),
         };
 
-        match self.audio.start(
-            mode,
-            &device,
-            self.cfg.chunk_ms,
-            self.cfg.tail_ms,
-            self.audio_tx.clone(),
-        ) {
+        match self.audio.start(mode, &device, self.cfg.chunk_ms, self.audio_tx.clone()) {
             Ok(_) => {
                 self.recording = true;
                 self.record_mode = Some(mode);
@@ -400,23 +472,17 @@ impl InterviewApp {
     }
 
     fn stop_recording(&mut self) {
-        if !self.recording {
-            return;
-        }
-        // Неблокирующая остановка: только даём сигнал потоку захвата.
-        // Поток ещё покрутится TAIL_MS, собирая хвост loopback.
-        // Слив буфера + распознавание — в poll_channels(), когда is_active() станет false.
+        if !self.recording { return; }
         self.audio.stop();
         self.recording = false;
         self.stopping = true;
-
         self.set_status(self.t("main.stopping"));
         self.log("Recording stop signalled");
     }
 
-    fn apply_transcript_event(&mut self, event: TranscriptEvent) {
+    fn apply_whisper_event(&mut self, event: WhisperEvent) {
         match event {
-            TranscriptEvent::Final { text, source } => {
+            WhisperEvent::Final { text, source } => {
                 let line = format!("[{source}] {text}");
                 if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
                     self.transcript.push('\n');
@@ -429,22 +495,101 @@ impl InterviewApp {
                     self.ask_ai();
                 }
             }
-            TranscriptEvent::Status(msg) => {
-                self.vosk_status = msg.clone();
-                self.log(&msg);
+            WhisperEvent::LoadRequest { dll_dir, model_path } => {
+                let tx = self.whisper_tx.clone();
+                let _ = tx.send(WhisperEvent::Status(format!(
+                    "Loading model {} into Whisper...",
+                    model_path.file_name().unwrap_or_default().to_string_lossy()
+                )));
+                self.whisper.load_async(dll_dir, model_path, tx);
             }
-            TranscriptEvent::Error(msg) => {
-                self.vosk_status = self.t("vosk.error").to_string();
-                self.big_status.clear();
+            WhisperEvent::Status(msg) => {
+                self.whisper_status = msg.clone();
                 self.log(&msg);
+                // Подсказка apply_progress о текущем этапе по строке статуса
+                if self.apply_progress.active {
+                    if msg.starts_with("Шаг 1") {
+                        self.apply_progress.stage = "dll".into();
+                    } else if msg.starts_with("Шаг 2") {
+                        self.apply_progress.stage = "model".into();
+                    } else if msg.starts_with("Шаг 3") {
+                        self.apply_progress.stage = "load".into();
+                    }
+                }
+            }
+            WhisperEvent::Progress {
+                name,
+                downloaded,
+                total,
+                stage,
+            } => {
+                self.apply_progress.name = name.clone();
+                self.apply_progress.downloaded = downloaded;
+                self.apply_progress.total = total;
+                self.apply_progress.stage = stage.clone();
+
+                let pct = if total > 0 {
+                    ((downloaded as f64 / total as f64) * 100.0) as i64
+                } else {
+                    -1
+                };
+
+                // Обновляем whisper_status для отображения в строке состояния
+                let label = if pct >= 0 {
+                    format!("{}: {}%", name, pct)
+                } else if total > 0 {
+                    format!("{}: {}", name, whisper_setup::human_size(downloaded))
+                } else {
+                    format!("{}: {}", name, whisper_setup::human_size(downloaded))
+                };
+                self.whisper_status = label.clone();
+
+                // Логируем только при смене процента (каждые 5%) или на ключевых этапах
+                let should_log = stage == "resume"
+                    || stage == "done"
+                    || (pct >= 0 && (pct - self.apply_progress.last_log_pct).abs() >= 5);
+                if should_log {
+                    if stage == "resume" {
+                        self.log(&format!(
+                            "Resume: {} at {} ({})",
+                            name,
+                            whisper_setup::human_size(downloaded),
+                            if total > 0 {
+                                format!("{}/{}", pct, 100)
+                            } else {
+                                "?%".to_string()
+                            }
+                        ));
+                    } else if stage == "done" {
+                        self.log(&format!("Done: {} ({})", name, whisper_setup::human_size(downloaded)));
+                    } else if pct >= 0 {
+                        self.log(&format!(
+                            "{}: {}% ({} / {})",
+                            name,
+                            pct,
+                            whisper_setup::human_size(downloaded),
+                            whisper_setup::human_size(total)
+                        ));
+                    }
+                    self.apply_progress.last_log_pct = pct;
+                }
+
+                // Финальный этап скачивания — закрываем apply_progress
+                if stage == "done" && name.contains(".bin") {
+                    self.apply_progress.stage = "load".into();
+                }
+            }
+            WhisperEvent::Error(msg) => {
+                self.whisper_status = self.t("whisper.error").to_string();
+                self.big_status.clear();
+                self.log(&format!("ERROR: {}", msg));
+                self.apply_progress.active = false;
+                self.apply_progress.stage = "error".into();
             }
         }
     }
 
     fn poll_channels(&mut self) {
-        // --- Завершение неблокирующей остановки ---
-        // Когда поток захвата закончил (после TAIL_MS), сливаем остатки
-        // и скармливаем весь буфер VOSK'у.
         if self.stopping && !self.audio.is_active() {
             self.stopping = false;
 
@@ -454,44 +599,47 @@ impl InterviewApp {
                 None => "AUDIO",
             };
 
-            // Сливаем все оставшиеся аудио-куски в буфер.
             while let Ok(chunk) = self.audio_rx.try_recv() {
                 self.audio_buffer.extend_from_slice(&chunk);
             }
 
-            // Скармливаем весь буфер VOSK'у за один проход (как в C# версии).
-            if !self.audio_buffer.is_empty() {
-                self.transcriber.recognize(&self.audio_buffer, source);
-            }
+            let samples = self.audio_buffer.clone();
             self.audio_buffer.clear();
+
+            if !samples.is_empty() {
+                self.whisper.finalize(samples, source);
+            }
 
             self.record_mode = None;
             self.transcript_hint = self.t("main.live_speech").to_string();
             self.big_status = self.t("main.stopped").to_string();
             self.set_status(self.t("main.stopped"));
-            self.log("Recording stopped (tail collected)");
+            self.log("Recording stopped");
 
-            // Ждём финальный транскрипт, потом авто-отправка в AI.
             self.awaiting_transcript = true;
         }
 
-        // Копим аудио-куски в буфер во время записи.
-        // В VOSK не стримим — весь буфер отдаётся при остановке (как в C# версии).
         while let Ok(chunk) = self.audio_rx.try_recv() {
             self.audio_buffer.extend_from_slice(&chunk);
         }
 
-        while let Ok(event) = self.transcript_rx.try_recv() {
-            self.apply_transcript_event(event);
+        while let Ok(event) = self.whisper_rx.try_recv() {
+            self.apply_whisper_event(event);
         }
-        if self.transcriber.is_loaded() && !self.transcriber.is_loading() && self.vosk_status != self.t("vosk.ready") {
-            self.vosk_status = self.t("vosk.ready").to_string();
+
+        if self.whisper.is_loaded() && self.whisper_status != self.t("whisper.ready") {
+            // Если только что загрузилось (после apply) — отмечаем done
+            if self.apply_progress.active {
+                self.apply_progress.active = false;
+                self.apply_progress.stage = "done".into();
+                self.apply_progress.last_log_pct = 100;
+            }
+            self.whisper_status = self.t("whisper.ready").to_string();
         }
 
         while let Ok(event) = self.ai_rx.try_recv() {
             match event {
                 AiEvent::Answer(text) => {
-                    // Пишем в историю.
                     if !self.question.is_empty() {
                         if !self.history_questions.is_empty() {
                             self.history_questions.push(crate::core::helpers::ENTRY_SEP);
@@ -504,7 +652,6 @@ impl InterviewApp {
                         }
                         self.history_answers.push_str(&text);
                     }
-                    // Обрезаем историю, чтобы не копилась память.
                     trim_entries(&mut self.history_questions, MAX_HISTORY_ENTRIES);
                     trim_entries(&mut self.history_answers, MAX_HISTORY_ENTRIES);
                     self.answer = text;
@@ -513,7 +660,6 @@ impl InterviewApp {
                     self.log("AI request completed");
                 }
                 AiEvent::Error(err) => {
-                    // Пишем неотвеченный вопрос в историю с пометкой ошибки.
                     if !self.question.is_empty() {
                         if !self.history_questions.is_empty() {
                             self.history_questions.push(crate::core::helpers::ENTRY_SEP);
@@ -524,11 +670,8 @@ impl InterviewApp {
                         self.history_answers.push(crate::core::helpers::ENTRY_SEP);
                     }
                     self.history_answers.push_str(&format!("[ОШИБКА] {err}"));
-                    // Обрезаем историю, чтобы не копилась память.
                     trim_entries(&mut self.history_questions, MAX_HISTORY_ENTRIES);
                     trim_entries(&mut self.history_answers, MAX_HISTORY_ENTRIES);
-                    // answer не затираем — оставляем последний успешный ответ.
-                    // Ошибку показываем в last_error (под правым окном).
                     self.last_error = format!("{}: {err}", self.t("main.ai_error"));
                     self.big_status.clear();
                     self.set_status(self.t("main.ai_error"));
@@ -539,7 +682,6 @@ impl InterviewApp {
             self.ai_request_time = None;
         }
 
-        // Таймаут: если ответа нет 5 секунд — показываем предупреждение.
         if self.ai_busy {
             if let Some(start) = self.ai_request_time {
                 if start.elapsed() >= Duration::from_secs(5) {
@@ -555,9 +697,7 @@ impl InterviewApp {
                     self.active_hold = Some(HotkeySide::Left);
                     self.start_recording(AudioMode::Loopback);
                 }
-                HotkeyAction::LoopbackRelease
-                    if self.active_hold == Some(HotkeySide::Left) =>
-                {
+                HotkeyAction::LoopbackRelease if self.active_hold == Some(HotkeySide::Left) => {
                     self.active_hold = None;
                     if self.record_mode == Some(AudioMode::Loopback) {
                         self.stop_recording();
@@ -576,7 +716,6 @@ impl InterviewApp {
                 _ => {}
             }
         }
-
     }
 }
 
@@ -589,16 +728,15 @@ impl eframe::App for InterviewApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Theme::BG))
             .show(ctx, |ui| {
-                draw_header(
-                    ui,
-                    "Interview Assistant",
-                    "[<-] loopback  [->] mic",
-                    self.recording,
-                );
+                draw_header(ui, "Interview Assistant", "[<-] loopback  [->] mic", self.recording);
                 ui.add_space(8.0);
-
                 ui.horizontal(|ui| {
-                    let tab_names = [self.t("tab.main"), self.t("tab.history"), self.t("tab.settings"), self.t("tab.logs")];
+                    let tab_names = [
+                        self.t("tab.main"),
+                        self.t("tab.history"),
+                        self.t("tab.settings"),
+                        self.t("tab.logs"),
+                    ];
                     for (idx, name) in tab_names.iter().enumerate() {
                         let selected = self.tab == idx;
                         let (fill, text_color, stroke_color) = if selected {
@@ -617,34 +755,42 @@ impl eframe::App for InterviewApp {
                         }
                     }
                 });
-
                 ui.add_space(8.0);
-
                 match self.tab {
                     0 => crate::ui::main_tab::show(ui, self),
                     1 => crate::ui::history_tab::show(ui, self),
                     2 => crate::ui::settings_tab::show(ui, self),
                     _ => crate::ui::logs_tab::show(ui, self),
                 }
-
                 ui.add_space(8.0);
+
+                // В строке состояния: если идёт скачивание, показываем процент.
+                let whisper_info = if self.apply_progress.active
+                    && (self.apply_progress.stage == "dll"
+                        || self.apply_progress.stage == "model")
+                {
+                    let pct = self.apply_progress.pct();
+                    format!(
+                        "{}: {}% | {} Hz",
+                        self.apply_progress.name,
+                        pct,
+                        SAMPLE_RATE
+                    )
+                } else {
+                    format!("Whisper: {} | {} Hz", self.whisper_status, SAMPLE_RATE)
+                };
+
                 crate::ui::status_bar(
                     ui,
                     &self.status,
                     &format!("AI: {}", self.cfg.model),
-                    &format!(
-                        "VOSK: {} | {} Hz",
-                        self.vosk_status,
-                        SAMPLE_RATE
-                    ),
+                    &whisper_info,
                 );
             });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Даём VOSK-воркеру время на аккуратную очистку до того,
-        // как сработает Drop с таймаутом 3 секунды.
-        self.transcriber.unload();
+        self.whisper.unload();
         self.audio.stop();
     }
 }

@@ -11,19 +11,11 @@
 //! - Главный поток копит куски в буфер; при остановке весь буфер
 //!   отдаётся VOSK'у за один проход.
 //!
-//! Сбор хвоста loopback:
-//! - При остановке записи поток захвата ждёт TAIL_MS миллисекунд
-//!   перед дропом WASAPI-потока. Это даёт драйверу время доставить
-//!   последние звуковые буферы. Без этой паузы финальные
-//!   ~100-200 мс звука теряются внутри драйвера.
-//! - После дропа потока остатки из внутреннего буфера накопления
-//!   сливаются в канал.
-//!
 //! Неблокирующая остановка:
-//! - `stop()` только ставит флаг остановки и сразу возвращается.
-//! - Поток захвата заканчивает сам (сон + слив + очистка).
+//! - `stop()` ставит флаг остановки и сразу возвращается.
+//! - Поток захвата дропает стрим, сливает остатки и выходит.
 //! - Главный поток опрашивает `is_active()`, чтобы понять, что поток
-//!   вышел и весь хвостовой звук доставлен.
+//!   закончил.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -64,7 +56,7 @@ pub enum AudioMode {
 /// # Неблокирующая остановка
 ///
 /// `stop()` ставит флаг остановки и сразу возвращается. Поток захвата
-/// продолжает крутиться TAIL_MS для сбора хвоста loopback, затем выходит.
+/// дропает стрим, сливает остатки буфера и выходит.
 /// Дёргай `is_active()`, чтобы проверить, закончил ли поток.
 pub struct AudioRecorder {
     stop_flag: Arc<AtomicBool>,
@@ -84,7 +76,7 @@ impl AudioRecorder {
         }
     }
 
-    /// true, пока поток захвата крутится (включая ожидание хвоста).
+    /// true, пока поток захвата крутится.
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
     }
@@ -92,14 +84,12 @@ impl AudioRecorder {
     /// Запускает захват звука с указанного устройства.
     ///
     /// `chunk_ms` — как часто слать аудио-куски в `tx`.
-    /// `tail_ms` — задержка после остановки для сбора хвоста loopback.
     /// Если запись уже идёт — сначала останавливает.
     pub fn start(
         &mut self,
         mode: AudioMode,
         device_name: &str,
         chunk_ms: u32,
-        tail_ms: u32,
         tx: Sender<Vec<i16>>,
     ) -> Result<()> {
         if self.is_active() {
@@ -119,7 +109,7 @@ impl AudioRecorder {
             .name("audio-capture".into())
             .spawn(move || {
                 if let Err(err) =
-                    capture_loop(device, mode, chunk_ms, tail_ms, stop_flag, tx, audio_buffer)
+                    capture_loop(device, mode, chunk_ms, stop_flag, tx, audio_buffer)
                 {
                     eprintln!("audio capture error: {err}");
                 }
@@ -132,10 +122,6 @@ impl AudioRecorder {
     }
 
     /// Даёт сигнал потоку захвата остановиться. Возвращается сразу.
-    ///
-    /// Поток ещё покрутится TAIL_MS для сбора хвоста loopback,
-    /// потом сольёт остатки и выйдет. Используй `is_active()`, чтобы
-    /// понять, когда он полностью остановился.
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         // Отсоединяем ручку потока — он закончит сам.
@@ -198,12 +184,11 @@ fn pick_device(mode: AudioMode, device_name: &str) -> Result<AudioDeviceInfo> {
 // ---------------------------------------------------------------------------
 
 /// Главный цикл захвата. Открывает устройство, запускает поток, ждёт флага
-/// остановки, затем собирает хвост loopback и сливает остатки.
+/// остановки, дропает стрим и сливает остатки буфера.
 fn capture_loop(
     device_info: AudioDeviceInfo,
     mode: AudioMode,
     chunk_ms: u32,
-    tail_ms: u32,
     stop_flag: Arc<AtomicBool>,
     tx: Sender<Vec<i16>>,
     buffer: Arc<Mutex<Vec<i16>>>,
@@ -241,12 +226,14 @@ fn capture_loop(
         thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    // --- Сбор хвоста loopback ---
-    // Держим поток живым ещё tail_ms, чтобы WASAPI доставил последние буферы.
-    thread::sleep(std::time::Duration::from_millis(tail_ms as u64));
+    // Даём WASAPI время доставить последние буферы (200 мс).
+    // Без этой паузы последние 100-200 мс аудио теряются внутри драйвера.
+    thread::sleep(std::time::Duration::from_millis(200));
+
+    // Дропаем стрим — последние данные уже в наших буферах.
     drop(stream);
 
-    // Сливаем остатки из буфера накопления.
+    // Сливаем остатки из буфера накопления (несколько блоков по 10 мс).
     {
         let mut buf = buffer.lock();
         if !buf.is_empty() {

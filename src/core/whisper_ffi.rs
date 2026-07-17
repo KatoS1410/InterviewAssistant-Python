@@ -7,8 +7,6 @@ use std::path::Path;
 use libloading::{Library, Symbol};
 
 // Windows API: SetDllDirectoryW — добавляет папку в пути поиска DLL.
-// whisper.dll зависит от ggml.dll, SDL2.dll, parakeet.dll в той же папке.
-// SetDllDirectoryW нужно, чтобы Windows нашла их до LoadLibraryExW.
 #[cfg(windows)]
 extern "system" {
     fn SetDllDirectoryW(lpPathName: *const u16) -> i32;
@@ -30,7 +28,10 @@ fn add_dll_directory(path: &Path) {
 #[cfg(not(windows))]
 fn add_dll_directory(_path: &Path) {}
 
-/// Непрозрачный контекст whisper (держит загруженную модель в памяти).
+/// Заглушка для старых ggml без backend_load.
+unsafe extern "C" fn noop_backend_load(_p: *const c_char) {}
+
+/// Непрозрачный контекст whisper.
 #[repr(C)]
 pub struct WhisperContext {
     _private: [u8; 0],
@@ -38,37 +39,31 @@ pub struct WhisperContext {
 
 /// Параметры инициализации контекста (whisper_context_params из whisper.h).
 ///
-/// Раскладка (20 байт, проверено через Python ctypes):
-///   bool use_gpu;       // смещение 0  (1 байт)
-///   bool flash_attn;    // смещение 1  (1 байт)
-///   // 2 байта выравнивания
-///   int  gpu_device;    // смещение 4  (4 байта)
-///   bool dtw;           // смещение 8  (1 байт)
-///   // 3 байта выравнивания
-///   int  devices;       // смещение 12 (4 байта) — битовая маска, НЕ указатель
-///   int  backends;      // смещение 16 (4 байта) — битовая маска, НЕ указатель
-/// Итого: 20 байт.
+/// В актуальных сборках whisper.cpp (с ggml-backend) раскладка 32 байта:
+///   bool use_gpu;                        // смещение 0
+///   bool flash_attn;                     // смещение 1
+///   int  gpu_device;                     // смещение 4
+///   bool dtw;                            // смещение 8
+///   struct ggml_backend_device * device; // смещение 16 (указатель!)
+///   struct ggml_backend * backend;       // смещение 24 (указатель!)
 #[repr(C)]
 pub struct WhisperContextParams {
-    pub use_gpu: u8,       // смещение 0
-    pub flash_attn: u8,    // смещение 1
-    pub _pad1: [u8; 2],    // смещение 2-3
-    pub gpu_device: c_int, // смещение 4-7
-    pub dtw: u8,           // смещение 8
-    pub _pad2: [u8; 3],    // смещение 9-11
-    pub devices: c_int,    // смещение 12-15
-    pub backends: c_int,   // смещение 16-19
+    pub use_gpu: u8,
+    pub flash_attn: u8,
+    pub _pad1: [u8; 2],
+    pub gpu_device: c_int,
+    pub dtw: u8,
+    pub _pad2: [u8; 7],
+    pub device: *mut u8,
+    pub backend: *mut u8,
 }
 
-/// Стратегии сэмплирования для whisper.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum WhisperSamplingStrategy {
     Greedy = 0,
-    BeamSearch = 1,
 }
 
-/// Полные параметры для whisper_full().
 #[repr(C)]
 pub struct WhisperFullParams {
     pub strategy: c_int,
@@ -115,6 +110,7 @@ pub struct WhisperFullParams {
 
 /// Загруженная whisper.dll с указателями на функции.
 pub struct WhisperDll {
+    _ggml_lib: Library,
     _lib: Library,
     pub context_default_params_by_ref:
         unsafe extern "C" fn(*mut WhisperContextParams),
@@ -125,39 +121,54 @@ pub struct WhisperDll {
     pub full: unsafe extern "C" fn(*mut WhisperContext, WhisperFullParams, *const c_float, c_int) -> c_int,
     pub full_n_segments: unsafe extern "C" fn(*mut WhisperContext) -> c_int,
     pub full_get_segment_text: unsafe extern "C" fn(*mut WhisperContext, c_int) -> *const c_char,
+    backend_load_all_from_path: unsafe extern "C" fn(*const c_char),
 }
 
 impl WhisperDll {
-    /// Загружает whisper.dll из указанной папки.
     pub fn load(dll_dir: &Path) -> Result<Self, String> {
         let dll_path = dll_dir.join("whisper.dll");
         if !dll_path.exists() {
             return Err(format!("whisper.dll not found at {}", dll_path.display()));
         }
 
-        // Добавляем папку DLL в пути поиска, чтобы whisper.dll нашла свои
-        // зависимости (ggml.dll, SDL2.dll, parakeet.dll) в той же папке.
-        // Путь должен быть абсолютным — SetDllDirectoryW этого требует.
         let dll_dir_abs = dll_dir
             .canonicalize()
             .unwrap_or_else(|_| dll_dir.to_path_buf());
         add_dll_directory(&dll_dir_abs);
 
-        // Приводим путь DLL к абсолютному — libloading использует
-        // LOAD_WITH_ALTERED_SEARCH_PATH для путей с разделителями,
-        // что говорит Windows искать зависимости в папке DLL.
+        // Грузим ggml.dll — именно через неё whisper.dll регистрирует бэкенды.
+        // В ggml.dll лежит ggml_backend_load_all_from_path.
+        let ggml_path = dll_dir_abs.join("ggml.dll");
+        let ggml_lib = unsafe {
+            if ggml_path.exists() {
+                Library::new(&ggml_path)
+                    .map_err(|e| format!("Failed to load ggml.dll: {e}"))?
+            } else {
+                // Фолбэк для старых сборок: ggml.dll может отсутствовать.
+                Library::new(&dll_dir_abs.join("whisper.dll"))
+                    .map_err(|e| format!("Failed to load whisper.dll as ggml fallback: {e}"))?
+            }
+        };
+
         let dll_path_abs = dll_path
             .canonicalize()
             .unwrap_or_else(|_| dll_path.clone());
-
-        // БЕЗОПАСНОСТЬ: libloading грузит нативную библиотеку. Доверяем whisper.dll.
         let lib = unsafe {
-            Library::new(&dll_path_abs).map_err(|e| format!("Failed to load whisper.dll: {e}"))?
+            Library::new(&dll_path_abs)
+                .map_err(|e| format!("Failed to load whisper.dll: {e}"))?
         };
 
-        // БЕЗОПАСНОСТЬ: Грузим символы по точным C-именам из whisper.h.
-        // Сигнатуры функций должны точно совпадать с C ABI.
-        // Извлекаем сырые указатели и дропаем Symbols до перемещения `lib`.
+        // ggml_backend_load_all_from_path — опциональный символ.
+        let backend_load_all_from_path: unsafe extern "C" fn(*const c_char) = unsafe {
+            let sym: Option<Symbol<unsafe extern "C" fn(*const c_char)>> = ggml_lib
+                .get(b"ggml_backend_load_all_from_path\0")
+                .ok();
+            match sym {
+                Some(s) => *s,
+                None => noop_backend_load,
+            }
+        };
+
         let context_default_params_by_ref: unsafe extern "C" fn(*mut WhisperContextParams) = {
             let sym: Symbol<unsafe extern "C" fn(*mut WhisperContextParams)> = unsafe {
                 lib.get(b"whisper_context_default_params_by_ref\0")
@@ -237,6 +248,7 @@ impl WhisperDll {
         };
 
         Ok(Self {
+            _ggml_lib: ggml_lib,
             _lib: lib,
             context_default_params_by_ref,
             init_from_file_with_params_no_state,
@@ -245,29 +257,29 @@ impl WhisperDll {
             full,
             full_n_segments,
             full_get_segment_text,
+            backend_load_all_from_path,
         })
     }
 
     /// Создаёт контекст whisper из файла модели с параметрами только-CPU.
-    /// Модель остаётся в памяти до вызова `free_context`.
     pub unsafe fn init_context(&self, model_path: &str) -> Result<*mut WhisperContext, String> {
         let c_path = CString::new(model_path)
             .map_err(|e| format!("Invalid model path: {e}"))?;
 
-        // Собираем параметры контекста только-CPU.
-        // use_gpu = 0 (false) — только CPU
-        // backends = 1 (битовая маска GGML_BACKEND_TYPE_CPU)
-        // devices = 1 (хотя бы одно устройство должно быть заявлено)
-        let ctx_params = WhisperContextParams {
-            use_gpu: 0,
-            flash_attn: 0,
-            _pad1: [0; 2],
-            gpu_device: 0,
-            dtw: 0,
-            _pad2: [0; 3],
-            devices: 1,
-            backends: 1,
-        };
+        // === ВАЖНО: подгружаем CPU/GPU-бэкенды до создания контекста. ===
+        let model_parent = std::path::Path::new(model_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        if let Some(dir_str) = model_parent.to_str() {
+            if let Ok(c_dir) = CString::new(dir_str) {
+                (self.backend_load_all_from_path)(c_dir.as_ptr());
+            }
+        }
+
+        let mut ctx_params: WhisperContextParams = std::mem::zeroed();
+        (self.context_default_params_by_ref)(&mut ctx_params);
+        ctx_params.use_gpu = 0;
 
         let ctx = (self.init_from_file_with_params_no_state)(c_path.as_ptr(), &ctx_params);
         if ctx.is_null() {
@@ -279,23 +291,18 @@ impl WhisperDll {
         Ok(ctx)
     }
 
-    /// Освобождает контекст whisper и выгружает модель из памяти.
     pub unsafe fn free_context(&self, ctx: *mut WhisperContext) {
         if !ctx.is_null() {
             (self.free)(ctx);
         }
     }
 
-    /// Создаёт параметры по умолчанию для whisper_full().
-    /// whisper_full_default_params_by_ref заполняет структуру по указателю (возвращает void).
     pub unsafe fn default_params(&self, strategy: WhisperSamplingStrategy) -> WhisperFullParams {
         let mut params: WhisperFullParams = std::mem::zeroed();
         (self.full_default_params)(strategy as c_int, &mut params);
         params
     }
 
-    /// Запускает инференс на звуковых образцах.
-    /// Возвращает 0 при успехе, не ноль при ошибке.
     pub unsafe fn run_full(
         &self,
         ctx: *mut WhisperContext,
@@ -309,12 +316,10 @@ impl WhisperDll {
         Ok(ret)
     }
 
-    /// Возвращает количество сегментов после успешного whisper_full().
     pub unsafe fn n_segments(&self, ctx: *mut WhisperContext) -> i32 {
         (self.full_n_segments)(ctx) as i32
     }
 
-    /// Возвращает текст сегмента по индексу.
     pub unsafe fn segment_text(&self, ctx: *mut WhisperContext, index: i32) -> String {
         let ptr = (self.full_get_segment_text)(ctx, index as c_int);
         if ptr.is_null() {

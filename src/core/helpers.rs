@@ -1,3 +1,12 @@
+use std::path::PathBuf;
+
+/// Возвращает путь к папке с файлами Whisper (модель, DLL).
+pub fn whisper_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".katos_whisper")
+}
+
 pub fn timestamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
